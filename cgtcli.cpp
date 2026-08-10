@@ -116,7 +116,7 @@ static void cgtUsage(void) {
   printf("  -R                  Activate random mode.\n");
   printf("  -b                  Enable backup mode to resume from last progress.\n");
   printf("  -u                  Search for uncompressed public keys or use uncompressed targets.\n");
-  printf("  -G <ID>             Specify GPU ID(s) to use, e.g. \"0\" or \"0,1\" for multiple GPUs.\n");
+  printf("  -G <ID>             Specify the GPU ID to use, default is 0.\n");
   printf("  -h, --help          Display this help message.\n\n");
 
   printf("Note: When using -i, all targets in the file must be of the same type (all addresses or all public keys).\n");
@@ -131,22 +131,6 @@ static bool cgtNeedValue(int argc, char **argv, int i, const char *what) {
   if (i + 1 < argc && argv[i + 1][0] != '\0') return true;
   fprintf(stderr, "[ERROR] A value is required after the %s parameter.\n", what);
   return false;
-}
-
-/* Parse comma-separated GPU IDs, e.g. "0,1,2" */
-static std::vector<int> cgtParseGpuIds(const std::string &s) {
-  std::vector<int> ids;
-  size_t start = 0;
-  while (start < s.size()) {
-    size_t end = s.find(',', start);
-    if (end == std::string::npos) end = s.size();
-    std::string part = s.substr(start, end - start);
-    if (!part.empty()) {
-      ids.push_back(atoi(part.c_str()));
-    }
-    start = end + 1;
-  }
-  return ids;
 }
 
 int main(int argc, char **argv) {
@@ -176,8 +160,7 @@ int main(int argc, char **argv) {
     else if (a == "-b") cfg.resume = true;
     else if (a == "-G") {
       if (!cgtNeedValue(argc, argv, i, "-G")) return -1;
-      std::vector<int> gpuIds = cgtParseGpuIds(argv[++i]);
-      if (!gpuIds.empty()) cfg.device = gpuIds[0];  /* Keep single ID for backwards compat */
+      cfg.device = atoi(argv[++i]);
     } else {
       fprintf(stderr, "[ERROR] Unknown parameter: %s\n", a.c_str());
       return -1;
@@ -275,107 +258,40 @@ int main(int argc, char **argv) {
     fprintf(stdout, "[INFO] No CUDA-enabled GPU was detected. Exiting.\n");
     return -1;
   }
-
-  /* Parse GPU IDs from command line (comma-separated) */
-  std::vector<int> gpuIds;
-  for (int i = 1; i < argc; i++) {
-    std::string a = argv[i];
-    if (a == "-G" && i + 1 < argc) {
-      gpuIds = cgtParseGpuIds(argv[++i]);
-      break;
-    }
+  if (cfg.device < 0 || cfg.device >= (int)devs.size()) {
+    fprintf(stdout, "[INFO] Invalid GPU ID %d specified. No device detected with this ID.\n", cfg.device);
+    fprintf(stdout, "[INFO] Detected %d GPU(s). Valid IDs are from 0 to %d.\n",
+            (int)devs.size(), (int)devs.size() - 1);
+    return -1;
   }
 
-  /* Validate GPU IDs */
-  if (gpuIds.empty()) {
-    gpuIds.push_back(0);  /* Default to GPU 0 */
-  }
-  for (int id : gpuIds) {
-    if (id < 0 || id >= (int)devs.size()) {
-      fprintf(stdout, "[INFO] Invalid GPU ID %d specified. Detected %d GPU(s), valid IDs: 0-%d.\n",
-              id, (int)devs.size(), (int)devs.size() - 1);
-      return -1;
-    }
-  }
-
-  /* Use multi-GPU manager if more than one GPU specified */
-  CgtMultiGpu *multiGpu = nullptr;
-  CgtGpu *singleGpu = nullptr;
-  
-  if (gpuIds.size() > 1) {
-    /* Multi-GPU mode */
-    multiGpu = new CgtMultiGpu();
-    std::string err;
-    if (!multiGpu->init(gpuIds, err)) {
-      fprintf(stderr, "[ERROR] Multi-GPU init failed: %s\n", err.c_str());
-      delete multiGpu;
-      return -1;
-    }
-    printf("[+] Multi-GPU mode: %zu GPUs active\n", gpuIds.size());
-  } else {
-    /* Single GPU mode (backward compatible) */
-    singleGpu = new CgtGpu();
-    std::string err;
-    if (!singleGpu->open(gpuIds[0], err)) {
-      fprintf(stderr, "[ERROR] GPU init failed: %s\n", err.c_str());
-      delete singleGpu;
-      return -1;
-    }
-  }
-
-  /* Upload filters to all GPUs */
+  CgtGpu gpu;
   std::string err;
-  if (multiGpu) {
-    multiGpu->setModes(!cfg.uncompressed, cfg.uncompressed);
-    if (pkMode) {
-      multiGpu->setModes(true, false);
-      if (!multiGpu->uploadPubkeyFilter(pkpool.bloomData(), pkpool.bloomBytes(),
-                                        (uint64_t)pkpool.bloomBits(), pkpool.bloomHashCount(),
-                                        pkpool.xCoordData(), pkpool.xCoordCount(), err)) {
-        fprintf(stderr, "[ERROR] Pubkey filter upload failed: %s\n", err.c_str());
-        delete multiGpu;
-        return -1;
-      }
-    } else {
-      if (!multiGpu->uploadFilter(pool.bloomData(), pool.bloomBytes(),
-                                  (uint64_t)pool.bloomBits(), pool.bloomHashCount(), err)) {
-        fprintf(stderr, "[ERROR] Filter upload failed: %s\n", err.c_str());
-        delete multiGpu;
-        return -1;
-      }
+  if (!gpu.open(cfg.device, err)) {
+    fprintf(stderr, "[ERROR] GPU init failed: %s\n", err.c_str());
+    return -1;
+  }
+  if (pkMode) {
+    /* One x per point, so the kernel needs exactly one comparison per key -
+       the COMP specialisation - regardless of how the targets were written. */
+    gpu.setModes(true, false);
+    if (!gpu.uploadPubkeyFilter(pkpool.bloomData(), pkpool.bloomBytes(),
+                                (uint64_t)pkpool.bloomBits(), pkpool.bloomHashCount(),
+                                pkpool.xCoordData(), pkpool.xCoordCount(), err)) {
+      fprintf(stderr, "[ERROR] Pubkey filter upload failed: %s\n", err.c_str());
+      return -1;
     }
   } else {
-    if (pkMode) {
-      singleGpu->setModes(true, false);
-      if (!singleGpu->uploadPubkeyFilter(pkpool.bloomData(), pkpool.bloomBytes(),
-                                          (uint64_t)pkpool.bloomBits(), pkpool.bloomHashCount(),
-                                          pkpool.xCoordData(), pkpool.xCoordCount(), err)) {
-        fprintf(stderr, "[ERROR] Pubkey filter upload failed: %s\n", err.c_str());
-        delete singleGpu;
-        return -1;
-      }
-    } else {
-      singleGpu->setModes(!cfg.uncompressed, cfg.uncompressed);
-      if (!singleGpu->uploadFilter(pool.bloomData(), pool.bloomBytes(),
-                                    (uint64_t)pool.bloomBits(), pool.bloomHashCount(), err)) {
-        fprintf(stderr, "[ERROR] Filter upload failed: %s\n", err.c_str());
-        delete singleGpu;
-        return -1;
-      }
+    gpu.setModes(!cfg.uncompressed, cfg.uncompressed);
+    if (!gpu.uploadFilter(pool.bloomData(), pool.bloomBytes(),
+                          (uint64_t)pool.bloomBits(), pool.bloomHashCount(), err)) {
+      fprintf(stderr, "[ERROR] Filter upload failed: %s\n", err.c_str());
+      return -1;
     }
   }
 
-  /* Get lane count and stride */
-  int lanes = 0;
-  uint64_t stride = 0;
-  if (multiGpu) {
-    const std::vector<int> &laneCounts = multiGpu->lanesPerGpu();
-    for (int lc : laneCounts) lanes += lc;
-    stride = (uint64_t)lanes * (uint64_t)CGT_LANE_REGION;
-  } else {
-    lanes = singleGpu->laneCount();
-    stride = (uint64_t)lanes * (uint64_t)CGT_LANE_REGION;
-  }
+  const int lanes = gpu.laneCount();
+  const uint64_t stride = (uint64_t)lanes * (uint64_t)CGT_LANE_REGION;
 
   /* ---------------------------- the block walk ---------------------------
      Cut the range into `stride`-key blocks. One block is one GPU pass, and the
@@ -432,6 +348,7 @@ int main(int argc, char **argv) {
   if (!restored) walk.init(blockCount, cgtRand64(), cfg.random);
 
   /* -------------------------------- banner ------------------------------- */
+  const cgt_devinfo &d = gpu.info();
   time_t now = time(NULL);
 
   printf("\n[+] %s v.%s\n", CGT_NAME, CGT_RELEASE);
@@ -447,24 +364,10 @@ int main(int argc, char **argv) {
     printf("[+] Range (2^%s)\n", cfg.spanText.c_str());
   printf("[+] from : 0x%s\n", cgtToHex256(ksStart).c_str());
   printf("[+] to   : 0x%s\n", cgtToHex256(ksEnd).c_str());
-
-  if (multiGpu) {
-    const std::vector<cgt_devinfo> &infos = multiGpu->getInfo();
-    for (size_t i = 0; i < infos.size(); i++) {
-      const cgt_devinfo &d = infos[i];
-      printf("[+] GPU %zu: %s (%d SM, cap %d.%d, %.0f MB)\n", 
-             i, d.name.c_str(), d.smCount, d.major, d.minor, 
-             (double)d.memBytes / (1024.0 * 1024.0));
-    }
-    printf("[+] Total lanes %d, %s keys per pass\n", lanes,
-           cgtScaleCount((double)multiGpu->totalKeysPerPass()).c_str());
-  } else {
-    const cgt_devinfo &d = singleGpu->info();
-    printf("[+] GPU %d: %s (%d SM, cap %d.%d, %.0f MB)\n", d.id, d.name.c_str(),
-           d.smCount, d.major, d.minor, (double)d.memBytes / (1024.0 * 1024.0));
-    printf("[+] Lanes %d, %s keys per pass\n", lanes,
-           cgtScaleCount((double)singleGpu->keysPerPass()).c_str());
-  }
+  printf("[+] GPU %d: %s (%d SM, cap %d.%d, %.0f MB)\n", d.id, d.name.c_str(),
+         d.smCount, d.major, d.minor, (double)d.memBytes / (1024.0 * 1024.0));
+  printf("[+] Lanes %d, %s keys per pass\n", lanes,
+         cgtScaleCount((double)gpu.keysPerPass()).c_str());
   printf("[+] Coverage: %llu blocks of %s keys, each visited once\n",
          (unsigned long long)blockCount,
          cgtScaleCount((double)stride).c_str());
@@ -536,42 +439,18 @@ int main(int argc, char **argv) {
        device can slide its own anchors forward instead, and the host does no
        curve work at all. */
     if (havePrev && blk == prevBlock + 1) {
-      if (multiGpu) {
-        if (!multiGpu->advanceAnchors(err)) {
-          cgtClearStatus();
-          fprintf(stderr, "[ERROR] %s\n", err.c_str());
-          return -1;
-        }
-      } else {
-        if (!singleGpu->advanceAnchors(err)) {
-          cgtClearStatus();
-          fprintf(stderr, "[ERROR] %s\n", err.c_str());
-          return -1;
-        }
+      if (!gpu.advanceAnchors(err)) {
+        cgtClearStatus();
+        fprintf(stderr, "[ERROR] %s\n", err.c_str());
+        return -1;
       }
     } else {
       cgt_u256 seed;
       cgtAdd(seed, blockBase, halfSpan);
-      if (multiGpu) {
-        /* Для multi-GPU нужно вычислить смещения для каждого GPU */
-        std::vector<cgt_u256> offsets;
-        offsets.reserve(gpuIds.size());
-        for (size_t i = 0; i < gpuIds.size(); i++) {
-          cgt_u256 gpuOffset;
-          cgtSetU64(gpuOffset, i * CGT_LANE_REGION);
-          offsets.push_back(gpuOffset);
-        }
-        if (!multiGpu->seedAnchorsRandom(seed, offsets, err)) {
-          cgtClearStatus();
-          fprintf(stderr, "[ERROR] %s\n", err.c_str());
-          return -1;
-        }
-      } else {
-        if (!singleGpu->seedAnchorsRandom(seed, err)) {
-          cgtClearStatus();
-          fprintf(stderr, "[ERROR] %s\n", err.c_str());
-          return -1;
-        }
+      if (!gpu.seedAnchorsRandom(seed, err)) {
+        cgtClearStatus();
+        fprintf(stderr, "[ERROR] %s\n", err.c_str());
+        return -1;
       }
     }
     prevBlock = blk;
@@ -580,18 +459,10 @@ int main(int argc, char **argv) {
     double tSetup = profile ? cgtNow() : 0.0;
 
     hits.clear();
-    if (multiGpu) {
-      if (!multiGpu->runPass(hits, err)) {
-        cgtClearStatus();
-        fprintf(stderr, "[ERROR] %s\n", err.c_str());
-        return -1;
-      }
-    } else {
-      if (!singleGpu->runPass(hits, err)) {
-        cgtClearStatus();
-        fprintf(stderr, "[ERROR] %s\n", err.c_str());
-        return -1;
-      }
+    if (!gpu.runPass(hits, err)) {
+      cgtClearStatus();
+      fprintf(stderr, "[ERROR] %s\n", err.c_str());
+      return -1;
     }
     double tGpu = profile ? cgtNow() : 0.0;
 
@@ -600,7 +471,7 @@ int main(int argc, char **argv) {
       accGpu += (tGpu - tSetup);
     }
 
-    totalKeys += (double)(multiGpu ? multiGpu->totalKeysPerPass() : singleGpu->keysPerPass());
+    totalKeys += (double)gpu.keysPerPass();
 
     /* A key from the pass that just finished, shown so the run is visibly
        moving and it is obvious where in the range it currently is.

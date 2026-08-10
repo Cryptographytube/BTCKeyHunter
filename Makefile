@@ -16,7 +16,7 @@ TARGET    := cgtkey
 SELFTEST  := cgtcheck
 
 CU_SRC    := cgtgpu.cu
-CXX_SRC   := cgtcli.cpp cgtmath.cpp cgtdigest.cpp cgtpool.cpp cgtpkpool.cpp cgtspan.cpp cgtmulti.cpp
+CXX_SRC   := cgtcli.cpp cgtmath.cpp cgtdigest.cpp cgtpool.cpp cgtpkpool.cpp cgtspan.cpp
 TEST_SRC  := cgtcheck.cpp cgtmath.cpp cgtdigest.cpp cgtpool.cpp cgtpkpool.cpp cgtspan.cpp
 
 # ---------------------------------------------------------------------------
@@ -68,7 +68,7 @@ all: $(BIN)
 # One nvcc invocation for everything: it drives the host compiler for the .cpp
 # files itself, which keeps the host toolchain and flags consistent with the
 # device side and avoids link-time ABI mismatches.
-$(BIN): $(CU_SRC) $(CXX_SRC) cgtdef.h cgtmath.h cgtdigest.h cgtpool.h cgtpkpool.h cgtspan.h cgtgpu.h cgtwide.h cgtrmd.cuh cgtmulti.h
+$(BIN): $(CU_SRC) $(CXX_SRC) cgtdef.h cgtmath.h cgtdigest.h cgtpool.h cgtpkpool.h cgtspan.h cgtgpu.h cgtwide.h cgtrmd.cuh
 	$(NVCC) $(NVCCFLAGS) $(CXX_SRC) $(CU_SRC) -o $@
 
 selftest: $(TESTBIN)
