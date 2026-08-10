@@ -1,0 +1,12 @@
+```
+*.o
+*.obj
+*.out
+dist/
+build/
+*.log
+*.tmp
+*.swp
+.vscode/
+.idea/
+```
