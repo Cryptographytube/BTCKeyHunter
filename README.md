@@ -33,9 +33,11 @@ cgtgpu.obj
 
 ```
 ## RUN
+
 ```
 cgtkey_2048.exe -r 135 -i btc.txt -R
 
+```
 ```
 [+] CGTKEY v.1.0
 [+] Search: 2 targets [P2PKH]
@@ -49,7 +51,7 @@ cgtkey_2048.exe -r 135 -i btc.txt -R
 [+] Coverage: 18539391133371680.00 P blocks of 1.17 G keys, each visited once in random order
 [+] Engine: address (hash160)
 
-[GPU 3832.08 Mkey/s][Total 2^37.59][Prob 9.5e-28%][50% in 9.004e+22y][Found 0][67041B5862B10C59F2AE4A67F122462F1A]
+[GPU 3820.46 Mkey/s][Total 2^39.15][Prob 2.8e-27%][50% in 9.032e+22y][Found 0][55657E067FAD471BA9F8EDAC48B7832BA7]
 
 ```
 
