@@ -10,7 +10,28 @@ High-performance CUDA-based Bitcoin private key search engine with dual modes: h
 ```
 CGTbuild.bat
 ```
+## COMPILE
+```
+[*] CGTbuild: STRIDE_HALF=2048  arch=sm_120  retries=12
+[*] CUDA    : C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1
+[*] VS      : C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools
+[*] Toolset : 14.29.30133  (known-good for CUDA 13.1)
+[*] Stage 1: host .cpp at /Od ...
+[*] attempt 1/12: compile device obj ...
+cgtcli.obj
+cgtmath.obj
+cgtdigest.obj
+cgtpool.obj
+cgtpkpool.obj
+cgtspan.obj
+cgtgpu.obj
+    smoke test ...
+    smoke OK
 
+[+] BUILD OK: cgtkey.exe  (also copied to cgtkey_2048.exe)
+[+]   arch=sm_120  toolset=14.29.30133  CUDA=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1
+
+```
 
 ## Features
 
@@ -40,8 +61,8 @@ CGTbuild.bat
 
 | Mode | Speed | Hardware |
 |---|---|---|
-| Address (hash160) | 3,793 Mkey/s | RTX 5070 Ti |
-| **Pubkey (x-compare)** | **10,003 Mkey/s** | RTX 5070 Ti |
+| Address (hash160) | 3,8793 Mkey/s | RTX 5070 Ti |
+| **Pubkey (x-compare)** | **10,113 Mkey/s** | RTX 5070 Ti |
 
 Pubkey mode skips SHA-256 + RIPEMD-160 entirely and never computes y-coordinates.
 
