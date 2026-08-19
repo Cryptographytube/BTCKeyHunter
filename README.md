@@ -6,6 +6,11 @@
 High-performance CUDA-based Bitcoin private key search engine with dual modes: hash-based address search and x-coordinate-only public key search.
 
 ---
+## CMD
+```
+CGTbuild.bat
+```
+
 
 ## Features
 
