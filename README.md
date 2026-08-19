@@ -32,6 +32,26 @@ cgtgpu.obj
 [+]   arch=sm_120  toolset=14.29.30133  CUDA=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1
 
 ```
+## RUN
+```
+cgtkey_2048.exe -r 135 -i btc.txt -R
+
+```
+[+] CGTKEY v.1.0
+[+] Search: 2 targets [P2PKH]
+[+] Start Wed Aug 19 09:12:58 2026
+[+] Random mode
+[+] Range (2^135)
+[+] from : 0x4000000000000000000000000000000000
+[+] to   : 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+[+] GPU 0: NVIDIA GeForce RTX 5070 Ti (70 SM, cap 12.0, 16303 MB)
+[+] Lanes 35840, 1.17 G keys per pass
+[+] Coverage: 18539391133371680.00 P blocks of 1.17 G keys, each visited once in random order
+[+] Engine: address (hash160)
+
+[GPU 3832.08 Mkey/s][Total 2^37.59][Prob 9.5e-28%][50% in 9.004e+22y][Found 0][67041B5862B10C59F2AE4A67F122462F1A]
+
+```
 
 ## Features
 
