@@ -83,7 +83,7 @@ cgtkey_2048.exe -r 135 -i btc.txt -R
 
 | Mode | Speed | Hardware |
 |---|---|---|
-| Address (hash160) | 3,8793 Mkey/s | RTX 5070 Ti |
+| Address (hash160) | 3,893 Mkey/s | RTX 5070 Ti |
 | **Pubkey (x-compare)** | **10,113 Mkey/s** | RTX 5070 Ti |
 
 Pubkey mode skips SHA-256 + RIPEMD-160 entirely and never computes y-coordinates.
