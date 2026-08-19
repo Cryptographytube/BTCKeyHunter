@@ -95,9 +95,72 @@ static inline uint64_t cgtMix64(uint64_t z) {
   return z ^ (z >> 31);
 }
 
-CgtWalk::CgtWalk() : total(0), key(0), pos(0), half(1), shuffled(false) {}
+/* A Feistel half is up to 128 bits, so it needs two words. The permutation
+   runs over 2*half bits, and with half up to 128 that domain reaches the full
+   256-bit block count of a 2^256 range - which is what carries randomness into
+   the high bits of the base rather than freezing them at the range start. */
+struct cgtU128 { uint64_t lo, hi; };
 
-void CgtWalk::init(uint64_t count, uint64_t k, bool shuf) {
+/* Keep only the low `half` bits (half in 1..128). */
+static inline void cgtMaskHalf(cgtU128 &v, int half) {
+  if (half >= 128) return;
+  if (half >= 64) {
+    int r = half - 64;                       /* 0..63 bits kept in hi */
+    v.hi = (r == 0) ? 0ULL : (v.hi & ((1ULL << r) - 1ULL));
+  } else {
+    v.hi = 0;
+    v.lo &= (1ULL << half) - 1ULL;           /* half in 1..63 */
+  }
+}
+
+/* Round function. A Feistel network is a bijection for ANY round function, so
+   correctness never depends on what this returns - only the apparent
+   randomness does. Three splitmix passes couple both words of the half so a
+   change anywhere in R avalanches across the whole output. */
+static inline cgtU128 cgtRoundF(cgtU128 r, uint64_t key, int round, int half) {
+  uint64_t t   = cgtMix64(r.lo ^ key ^ ((uint64_t)round << 56));
+  uint64_t flo = cgtMix64(r.hi ^ t   ^ key);
+  uint64_t fhi = cgtMix64(t   ^ flo ^ ((uint64_t)round << 40));
+  cgtU128 f = { flo, fhi };
+  cgtMaskHalf(f, half);
+  return f;
+}
+
+/* 64 bits of `x` starting at bit `start`; reads past the top limb as zero. */
+static inline uint64_t cgtBits64(const cgt_u256 &x, int start) {
+  int limb = start >> 6, off = start & 63;
+  uint64_t lo = (limb   < CGT_LIMBS) ? x.w[limb]     : 0ULL;
+  uint64_t hi = (limb+1 < CGT_LIMBS) ? x.w[limb + 1] : 0ULL;
+  if (off == 0) return lo;
+  return (lo >> off) | (hi << (64 - off));
+}
+
+/* Pull the `half`-bit field of `x` that begins at bit `start` into a cgtU128. */
+static inline void cgtExtractHalf(const cgt_u256 &x, int start, int half,
+                                  cgtU128 &out) {
+  out.lo = cgtBits64(x, start);
+  out.hi = cgtBits64(x, start + 64);
+  cgtMaskHalf(out, half);
+}
+
+/* OR a 64-bit value into `out` at bit `start` (spilling into the next limb). */
+static inline void cgtOrBits64(cgt_u256 &out, int start, uint64_t v) {
+  if (!v) return;
+  int limb = start >> 6, off = start & 63;
+  if (limb < CGT_LIMBS) out.w[limb] |= v << off;
+  if (off && limb + 1 < CGT_LIMBS) out.w[limb + 1] |= v >> (64 - off);
+}
+
+static inline void cgtSetHalf(cgt_u256 &out, int start, const cgtU128 &v) {
+  cgtOrBits64(out, start,      v.lo);
+  cgtOrBits64(out, start + 64, v.hi);
+}
+
+CgtWalk::CgtWalk() : key(0), pos(0), half(1), shuffled(false) {
+  cgtSetZero(total);
+}
+
+void CgtWalk::init(const cgt_u256 &count, uint64_t k, bool shuf) {
   total = count;
   key = k;
   pos = 0;
@@ -106,47 +169,68 @@ void CgtWalk::init(uint64_t count, uint64_t k, bool shuf) {
   /* Feistel domain: the smallest 2*half-bit space that holds `count`. Keeping
      it that tight bounds the cycle walk - at worst the domain is twice the
      count, so the expected number of hops per block index is under two. */
-  int bits = 1;
-  while (bits < 64 && (count - 1) >> bits) bits++;
+  cgt_u256 cm1;
+  if (cgtIsZero(count)) {
+    cgtSetZero(cm1);
+  } else {
+    cgt_u256 one; cgtSetU64(one, 1);
+    cgtSub(cm1, count, one);
+  }
+  int bits = cgtBitLength(cm1);              /* 0 when count <= 1 */
+  if (bits < 1) bits = 1;
   half = (bits + 1) / 2;
-  if (half < 1) half = 1;
-  if (half > 31) half = 31;   /* 62-bit domain covers any reachable count */
+  if (half < 1)   half = 1;
+  if (half > 128) half = 128;                /* 256-bit domain covers any count */
+}
+
+bool CgtWalk::done(void) const {
+  cgt_u256 p; cgtSetU64(p, pos);
+  return cgtCmp(p, total) >= 0;
 }
 
 bool CgtWalk::setPosition(uint64_t p) {
-  if (p > total) return false;
+  cgt_u256 pp; cgtSetU64(pp, p);
+  if (cgtCmp(pp, total) > 0) return false;
   pos = p;
   return true;
 }
 
 /* One pass of the Feistel network over the 2*half-bit domain. */
-uint64_t CgtWalk::permute(uint64_t x) const {
-  const uint64_t mask = (1ULL << half) - 1ULL;
-  uint64_t l = (x >> half) & mask;
-  uint64_t r = x & mask;
+void CgtWalk::permute(const cgt_u256 &x, cgt_u256 &out) const {
+  cgtU128 r, l;
+  cgtExtractHalf(x, 0,    half, r);          /* low half  = R */
+  cgtExtractHalf(x, half, half, l);          /* next half = L */
   for (int i = 0; i < 4; i++) {
-    uint64_t f = cgtMix64(r ^ key ^ ((uint64_t)i << 56)) & mask;
-    uint64_t nl = r;
-    r = l ^ f;
+    cgtU128 f  = cgtRoundF(r, key, i, half);
+    cgtU128 nl = r;
+    r.lo = l.lo ^ f.lo;  r.hi = l.hi ^ f.hi;
     l = nl;
   }
-  return (l << half) | r;
+  cgtSetZero(out);
+  cgtSetHalf(out, 0,    r);                   /* out = (l << half) | r */
+  cgtSetHalf(out, half, l);
 }
 
-uint64_t CgtWalk::next(void) {
+cgt_u256 CgtWalk::next(void) {
   uint64_t i = pos++;
-  if (!shuffled) return i;
+  cgt_u256 idx; cgtSetU64(idx, i);
+  if (!shuffled) return idx;
 
   /* Cycle walking: iterate the permutation until it lands inside the real
-     block count. Because permute() is a bijection on the whole domain, the
-     values it skips form cycles that never re-enter [0, total), so this stays
-     a bijection on [0, total) - every block still comes up exactly once. */
-  uint64_t x = i;
+     block count. Because permute() is a bijection on the whole 2*half-bit
+     domain, the values it skips form cycles that never re-enter [0, total), so
+     this stays a bijection on [0, total) - every block still comes up exactly
+     once, and distinct counter values i=0,1,2,... yield distinct blocks. Over a
+     huge range the counter never approaches `total`, so this samples the range
+     without repeats and with every bit of the base randomised. */
+  cgt_u256 x = idx;
   for (int guard = 0; guard < 512; guard++) {
-    x = permute(x);
-    if (x < total) return x;
+    cgt_u256 y;
+    permute(x, y);
+    if (cgtCmp(y, total) < 0) return y;
+    x = y;
   }
-  return i;   /* unreachable in practice; ascending order is still valid */
+  return idx;   /* unreachable in practice; ascending order is still valid */
 }
 
 /* ---------------- checkpoint ---------------- */
@@ -156,7 +240,7 @@ CgtCheckpoint::~CgtCheckpoint() {}
 
 /* Plain key/value text so a stopped run can be inspected, and so a file from
    an older build is rejected on the version line rather than misread. */
-#define CGT_RESUME_MAGIC "CGTKEY-RESUME 2"
+#define CGT_RESUME_MAGIC "CGTKEY-RESUME 3"
 
 bool CgtCheckpoint::load(cgt_resume &st) {
   std::ifstream f(path.c_str());
@@ -167,7 +251,8 @@ bool CgtCheckpoint::load(cgt_resume &st) {
   if (cgtTrim(line) != CGT_RESUME_MAGIC) return false;
 
   bool haveStart = false, haveEnd = false;
-  st.stride = st.blocks = st.key = st.pos = st.found = 0;
+  st.stride = st.key = st.pos = st.found = 0;
+  cgtSetZero(st.blocks);
   st.shuffled = false;
 
   while (std::getline(f, line)) {
@@ -180,13 +265,13 @@ bool CgtCheckpoint::load(cgt_resume &st) {
     if      (k == "start")  haveStart = cgtParseHex256(v, st.start);
     else if (k == "end")    haveEnd   = cgtParseHex256(v, st.end);
     else if (k == "stride") st.stride = strtoull(v.c_str(), NULL, 10);
-    else if (k == "blocks") st.blocks = strtoull(v.c_str(), NULL, 10);
+    else if (k == "blocks") cgtParseHex256(v, st.blocks);
     else if (k == "key")    st.key    = strtoull(v.c_str(), NULL, 16);
     else if (k == "pos")    st.pos    = strtoull(v.c_str(), NULL, 10);
     else if (k == "found")  st.found  = strtoull(v.c_str(), NULL, 10);
     else if (k == "order")  st.shuffled = (v == "random");
   }
-  return haveStart && haveEnd && st.stride != 0 && st.blocks != 0;
+  return haveStart && haveEnd && st.stride != 0 && !cgtIsZero(st.blocks);
 }
 
 bool CgtCheckpoint::save(const cgt_resume &st) {
@@ -201,7 +286,7 @@ bool CgtCheckpoint::save(const cgt_resume &st) {
     f << "start "  << cgtToHex256Pad(st.start) << "\n";
     f << "end "    << cgtToHex256Pad(st.end)   << "\n";
     f << "stride " << st.stride << "\n";
-    f << "blocks " << st.blocks << "\n";
+    f << "blocks " << cgtToHex256Pad(st.blocks) << "\n";
     f << "order "  << (st.shuffled ? "random" : "linear") << "\n";
     char buf[32];
     snprintf(buf, sizeof(buf), "%016llX", (unsigned long long)st.key);

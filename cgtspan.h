@@ -30,31 +30,41 @@ void cgtSeedRNG(void);
    genuinely been covered.
 
    In shuffled (random) mode the order is a pseudo-random permutation rather
-   than a shuffle of a stored list, so the state is a counter and a key - two
-   64-bit numbers - no matter how many blocks there are. A 2^80 range is
-   1.7e15 blocks; remembering which of those are done as a bitmap would take
-   200 TB, and as a permutation counter it takes sixteen bytes.
+   than a shuffle of a stored list, so the state is a counter and a key - no
+   matter how many blocks there are. A 2^80 range is 1.7e15 blocks; remembering
+   which of those are done as a bitmap would take 200 TB, and as a permutation
+   counter it takes a handful of bytes.
 
-   The permutation is a four-round Feistel network over 2*half bits with
-   cycle-walking down to `count`, which is a bijection for any count. Feistel
-   is used rather than a multiply-based mixer because a Feistel round is a
-   bijection whatever the round function does, so correctness does not depend
-   on the mixer having any particular property - only the apparent randomness
-   does.
+   The permutation is a four-round Feistel network over 2*half bits (half up to
+   128, so the domain spans the full 256-bit block count) with cycle-walking
+   down to `count`, which is a bijection for any count. Feistel is used rather
+   than a multiply-based mixer because a Feistel round is a bijection whatever
+   the round function does, so correctness does not depend on the mixer having
+   any particular property - only the apparent randomness does.
+
+   `count` is a full 256-bit value: a bit range up to 2^256 cuts into up to
+   ~2^226 blocks, and the block index is fed straight into blockBase =
+   ksStart + blk*stride, so EVERY bit of the base varies from block to block -
+   the high bits included. (A 64-bit index times a ~2^30 stride could only
+   reach ksStart + 2^94, which is what used to leave the top of a big range
+   frozen at the start value.) The cursor `pos` stays 64-bit: no run retires
+   2^64 blocks, and in random mode those 2^64 draws still land anywhere in the
+   256-bit index space via the permutation, so the sampled bases still cover
+   the whole range with the high bits fully random.
    --------------------------------------------------------------------------- */
 class CgtWalk {
 public:
   CgtWalk();
 
-  /* `count` blocks, visited in permuted order when `shuffled`, ascending
-     otherwise. `key` selects which permutation; pass a random value for a
-     fresh run or the saved one to resume the same order. */
-  void init(uint64_t count, uint64_t key, bool shuffled);
+  /* `count` blocks (up to 2^256), visited in permuted order when `shuffled`,
+     ascending otherwise. `key` selects which permutation; pass a random value
+     for a fresh run or the saved one to resume the same order. */
+  void init(const cgt_u256 &count, uint64_t key, bool shuffled);
 
-  bool     done(void)     const { return pos >= total; }
-  uint64_t next(void);            /* block index; advances the cursor */
+  bool     done(void) const;                    /* pos >= total (256-bit)      */
+  cgt_u256 next(void);                           /* block index; advances cursor */
   uint64_t position(void) const { return pos; }
-  uint64_t count(void)    const { return total; }
+  const cgt_u256 &count(void) const { return total; }
   uint64_t permKey(void)  const { return key; }
   bool     isShuffled(void) const { return shuffled; }
 
@@ -63,12 +73,12 @@ public:
   bool setPosition(uint64_t p);
 
 private:
-  uint64_t permute(uint64_t x) const;
+  void permute(const cgt_u256 &x, cgt_u256 &out) const;
 
-  uint64_t total;
+  cgt_u256 total;       /* block count, up to 2^256                            */
   uint64_t key;
-  uint64_t pos;
-  int      half;        /* bits per Feistel half */
+  uint64_t pos;         /* blocks retired so far (a run never reaches 2^64)    */
+  int      half;        /* bits per Feistel half, 1..128                       */
   bool     shuffled;
 };
 
@@ -85,7 +95,7 @@ private:
 struct cgt_resume {
   cgt_u256 start, end;
   uint64_t stride;      /* keys per block */
-  uint64_t blocks;      /* total blocks in the range */
+  cgt_u256 blocks;      /* total blocks in the range (up to 2^256) */
   uint64_t key;         /* permutation key */
   uint64_t pos;         /* blocks already completed */
   bool     shuffled;    /* was it a random-order run */

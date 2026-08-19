@@ -312,8 +312,16 @@ __device__ __forceinline__ void devFSqrN(u64 *r, const u64 *a, int n) {
  * the same exponent in 255 squarings and 15 multiplies.
  *
  * Naming below follows the run length: xN holds a^(2^N - 1).
+ *
+ * Marked __noinline__ on purpose. It runs once per batch (once per ~2049 keys
+ * per round), so inlining its 255 squarings + 15 multiplies into the kernel buys
+ * nothing at runtime but explodes the function the device front-end (cicc) has to
+ * optimise - at CGT_STRIDE_HALF=1024 that inlined body is what drove cicc into
+ * stack-overrun crashes and multi-minute stalls. Keeping it a real call shrinks
+ * the kernel, makes the compile reliable, and if anything lowers register
+ * pressure in the hot walk. Verified: same key found, same throughput.
  */
-__device__ void devFInv(u64 *r, const u64 *a) {
+__device__ __noinline__ void devFInv(u64 *r, const u64 *a) {
   u64 x2[4], x3[4], x6[4], x9[4], x11[4], x22[4], x44[4], x88[4];
   u64 x176[4], x220[4], x223[4], t[4];
 
@@ -589,6 +597,73 @@ __device__ __forceinline__ void devPackBE(const u64 *v, u32 w[8]) {
   }
 }
 
+/* ================= device-side Feistel permutation for random mode =========== */
+/* 4-round Feistel network on 16-bit lane index (supports up to 65536 lanes).
+   This permutes which physical lane processes which logical lane's region,
+   providing per-lane randomness within each block. The key is passed from host. */
+__device__ __forceinline__ u32 devFeistel16(u32 x, u32 key) {
+  /* Round 0 */
+  u32 roundKey0 = key ^ 0x00000000u;
+  u32 f0 = x ^ roundKey0;
+  f0 = (f0 ^ (f0 >> 8)) * 0x85EBCA6Bu;
+  f0 = (f0 ^ (f0 >> 13)) * 0xC2B2AE35u;
+  f0 = f0 ^ (f0 >> 16);
+  u32 left0 = x >> 8;
+  u32 right0 = x & 0xFF;
+  u32 newLeft0 = right0;
+  u32 newRight0 = left0 ^ (f0 & 0xFF);
+  x = (newLeft0 << 8) | newRight0;
+
+  /* Round 1 */
+  u32 roundKey1 = key ^ 0x9E3779B9u;
+  u32 f1 = x ^ roundKey1;
+  f1 = (f1 ^ (f1 >> 8)) * 0x85EBCA6Bu;
+  f1 = (f1 ^ (f1 >> 13)) * 0xC2B2AE35u;
+  f1 = f1 ^ (f1 >> 16);
+  u32 left1 = x >> 8;
+  u32 right1 = x & 0xFF;
+  u32 newLeft1 = right1;
+  u32 newRight1 = left1 ^ (f1 & 0xFF);
+  x = (newLeft1 << 8) | newRight1;
+
+  /* Round 2 */
+  u32 roundKey2 = key ^ 0x3C6EF372u;
+  u32 f2 = x ^ roundKey2;
+  f2 = (f2 ^ (f2 >> 8)) * 0x85EBCA6Bu;
+  f2 = (f2 ^ (f2 >> 13)) * 0xC2B2AE35u;
+  f2 = f2 ^ (f2 >> 16);
+  u32 left2 = x >> 8;
+  u32 right2 = x & 0xFF;
+  u32 newLeft2 = right2;
+  u32 newRight2 = left2 ^ (f2 & 0xFF);
+  x = (newLeft2 << 8) | newRight2;
+
+  /* Round 3 */
+  u32 roundKey3 = key ^ 0xDAB56D2Bu;
+  u32 f3 = x ^ roundKey3;
+  f3 = (f3 ^ (f3 >> 8)) * 0x85EBCA6Bu;
+  f3 = (f3 ^ (f3 >> 13)) * 0xC2B2AE35u;
+  f3 = f3 ^ (f3 >> 16);
+  u32 left3 = x >> 8;
+  u32 right3 = x & 0xFF;
+  u32 newLeft3 = right3;
+  u32 newRight3 = left3 ^ (f3 & 0xFF);
+  x = (newLeft3 << 8) | newRight3;
+
+  return x;
+}
+
+/* ================= device-side random offset within lane region ============= */
+/* Generate a pseudo-random offset within [0, CGT_LANE_REGION) for a given lane.
+   Uses a simple LCG seeded with lane index and a global seed. */
+__device__ __forceinline__ u32 devLaneOffset(u32 lane, u32 seed) {
+  u32 x = lane ^ seed;
+  x = (x ^ (x >> 16)) * 0x85EBCA6Bu;
+  x = (x ^ (x >> 13)) * 0xC2B2AE35u;
+  x = x ^ (x >> 16);
+  return x % CGT_LANE_REGION;
+}
+
 /* small kernel: slide each lane's anchor forward by the grid stride */
 __global__ void cgtAdvanceKernel(u64 *anchorX, u64 *anchorY,
                                  const u64 *gridX, const u64 *gridY) {
@@ -616,42 +691,114 @@ __global__ void cgtAdvanceKernel(u64 *anchorX, u64 *anchorY,
   }
 }
 
-/* seed kernel for random mode: anchor[i] = base + laneOff[i].
-   Lane 0's offset is the point at infinity (cannot be represented in affine),
-   so it gets the base verbatim. Every other lane does one point addition. */
+/* seed kernel for random mode: anchor[i] = base + laneOff[logicalLane] + laneOffset*G.
+   - Feistel permutation maps physical lane -> logical lane for per-lane randomness
+   - Random offset within [0, CGT_LANE_REGION) adds per-key randomness within region
+   Lane 0's offset is zero, result is the base + laneOff[logicalLane]. */
 __global__ void cgtSeedKernel(u64 *anchorX, u64 *anchorY,
                               const u64 *baseX, const u64 *baseY,
-                              const u64 *laneOffX, const u64 *laneOffY) {
-  int lane = blockIdx.x * blockDim.x + threadIdx.x;
-  u64 bx[4], by[4], ox[4], oy[4];
+                              const u64 *laneOffX, const u64 *laneOffY,
+                              u32 feistelKey, u32 offsetSeed, u32 totalLanes) {
+  int physicalLane = blockIdx.x * blockDim.x + threadIdx.x;
+  if (physicalLane >= totalLanes) return;
+  
+  /* Apply Feistel permutation to get logical lane */
+  u32 logicalLane = devFeistel16((u32)physicalLane, feistelKey);
+  if (logicalLane >= totalLanes) logicalLane = physicalLane;  /* fallback */
+  
+  /* Generate random offset within lane region [0, CGT_LANE_REGION) */
+  u32 laneOffset = devLaneOffset((u32)physicalLane, offsetSeed);
+  
+  /* Start with base point */
+  u64 tmpX[4], tmpY[4];
   #pragma unroll
   for (int i = 0; i < 4; i++) {
-    bx[i] = baseX[i];
-    by[i] = baseY[i];
-    ox[i] = laneOffX[lane * 4 + i];
-    oy[i] = laneOffY[lane * 4 + i];
+    tmpX[i] = baseX[i];
+    tmpY[i] = baseY[i];
   }
-  if (lane == 0) {
-    /* lane 0: offset is zero (infinity), result is the base */
+  
+  /* Add laneOff[logicalLane] (precomputed L_i = i * CGT_LANE_REGION * G) */
+  u64 dx[4], num[4], dInv[4], lam[4], xr[4], yr[4], t[4];
+  devFSub(dx, laneOffX + logicalLane * 4, tmpX);
+  devFSub(num, laneOffY + logicalLane * 4, tmpY);
+  devFInv(dInv, dx);
+  devFMul(lam, num, dInv);
+  devFSqr(xr, lam); devFSub(xr, xr, tmpX); devFSub(xr, xr, laneOffX + logicalLane * 4);
+  devFSub(t, tmpX, xr); devFMul(yr, lam, t); devFSub(yr, yr, tmpY);
+  #pragma unroll
+  for (int i = 0; i < 4; i++) {
+    tmpX[i] = xr[i];
+    tmpY[i] = yr[i];
+  }
+  
+  /* Add laneOffset * G using simple repeated addition (laneOffset < 16384) */
+  if (laneOffset > 0) {
+    /* Generator point G (little-endian limbs, w[0] = low word) */
+    const u64 gX[4] = {0x59F2815B16F81798ULL, 0x029BFCDB2DCE28D9ULL, 0x55A06295CE870B07ULL, 0x79BE667EF9DCBBACULL};
+    const u64 gY[4] = {0x9C47D08FFB10D4B8ULL, 0xFD17B448A6855419ULL, 0x5DA4FBFC0E1108A8ULL, 0x483ADA7726A3C465ULL};
+    
+    u64 curX[4], curY[4];
     #pragma unroll
     for (int i = 0; i < 4; i++) {
-      anchorX[i] = bx[i];
-      anchorY[i] = by[i];
+      curX[i] = gX[i];
+      curY[i] = gY[i];
     }
-  } else {
-    /* anchor = base + offset */
+    
+    for (int i = 0; i < (int)laneOffset; i++) {
+      devFSub(dx, curX, tmpX);
+      devFSub(num, curY, tmpY);
+      devFInv(dInv, dx);
+      devFMul(lam, num, dInv);
+      devFSqr(xr, lam); devFSub(xr, xr, tmpX); devFSub(xr, xr, curX);
+      devFSub(t, tmpX, xr); devFMul(yr, lam, t); devFSub(yr, yr, tmpY);
+      #pragma unroll
+      for (int j = 0; j < 4; j++) {
+        tmpX[j] = xr[j];
+        tmpY[j] = yr[j];
+      }
+    }
+  }
+  
+  /* Store final anchor point */
+  #pragma unroll
+  for (int i = 0; i < 4; i++) {
+    anchorX[physicalLane * 4 + i] = tmpX[i];
+    anchorY[physicalLane * 4 + i] = tmpY[i];
+  }
+}
+
+/* Exact seed kernel for sequential mode: anchor[lane] = base + laneOff[lane],
+   with no permutation and no random offset, so lane i sits at the exact centre
+   of the i-th region and the blocks tile the range with no gaps. laneOff[0] is
+   the point at infinity (stored as zero), so lane 0's anchor is base itself. */
+__global__ void cgtSeedExactKernel(u64 *anchorX, u64 *anchorY,
+                                   const u64 *baseX, const u64 *baseY,
+                                   const u64 *laneOffX, const u64 *laneOffY,
+                                   u32 totalLanes) {
+  int lane = blockIdx.x * blockDim.x + threadIdx.x;
+  if (lane >= totalLanes) return;
+
+  u64 tmpX[4], tmpY[4];
+  #pragma unroll
+  for (int i = 0; i < 4; i++) { tmpX[i] = baseX[i]; tmpY[i] = baseY[i]; }
+
+  if (lane != 0) {
+    /* tmp = base + laneOff[lane] (affine point addition, distinct points) */
     u64 dx[4], num[4], dInv[4], lam[4], xr[4], yr[4], t[4];
-    devFSub(dx, ox, bx);
-    devFSub(num, oy, by);
+    devFSub(dx, laneOffX + lane * 4, tmpX);
+    devFSub(num, laneOffY + lane * 4, tmpY);
     devFInv(dInv, dx);
     devFMul(lam, num, dInv);
-    devFSqr(xr, lam); devFSub(xr, xr, bx); devFSub(xr, xr, ox);
-    devFSub(t, bx, xr); devFMul(yr, lam, t); devFSub(yr, yr, by);
+    devFSqr(xr, lam); devFSub(xr, xr, tmpX); devFSub(xr, xr, laneOffX + lane * 4);
+    devFSub(t, tmpX, xr); devFMul(yr, lam, t); devFSub(yr, yr, tmpY);
     #pragma unroll
-    for (int i = 0; i < 4; i++) {
-      anchorX[lane * 4 + i] = xr[i];
-      anchorY[lane * 4 + i] = yr[i];
-    }
+    for (int i = 0; i < 4; i++) { tmpX[i] = xr[i]; tmpY[i] = yr[i]; }
+  }
+
+  #pragma unroll
+  for (int i = 0; i < 4; i++) {
+    anchorX[lane * 4 + i] = tmpX[i];
+    anchorY[lane * 4 + i] = tmpY[i];
   }
 }
 
@@ -1389,6 +1536,38 @@ bool CgtGpu::seedAnchors(const std::vector<cgt_u256> &keys, std::string &err) {
   return true;
 }
 
+/* Sequential mode fast exact seed: one host scalar multiply for the base point
+   base = (blockBase + halfSpan)*G, then a device kernel adds the precomputed
+   per-lane offset L_i = i*CGT_LANE_REGION*G. This gives every lane its exact
+   anchor in one ladder plus one parallel point-add, instead of `lanes` host
+   ladders, while keeping the tiling exact (no permutation, no random offset). */
+bool CgtGpu::seedAnchorsExact(const cgt_u256 &base, std::string &err) {
+  if (!ready) { err = "device not open"; return false; }
+
+  cgt_pt bp;
+  cgtPtMulG(bp, base);
+  uint64_t bx[4], by[4];
+  for (int j = 0; j < 4; j++) { bx[j] = bp.x.w[j]; by[j] = bp.y.w[j]; }
+  size_t sz = 4 * sizeof(uint64_t);
+  if (cudaMemcpy(dBaseX, bx, sz, cudaMemcpyHostToDevice) != cudaSuccess ||
+      cudaMemcpy(dBaseY, by, sz, cudaMemcpyHostToDevice) != cudaSuccess) {
+    err = "cudaMemcpy base point failed";
+    return false;
+  }
+
+  cgtSeedExactKernel<<<blocks, threadsPerBlock>>>(
+    (u64 *)dAnchorX, (u64 *)dAnchorY,
+    (const u64 *)dBaseX, (const u64 *)dBaseY,
+    (const u64 *)dLaneOffX, (const u64 *)dLaneOffY,
+    lanes);
+  cudaError_t e = cudaGetLastError();
+  if (e != cudaSuccess) {
+    err = std::string("exact seed kernel launch failed: ") + cudaGetErrorString(e);
+    return false;
+  }
+  return true;
+}
+
 /* Random mode: derive every lane's anchor point on the device from a single
    host scalar multiply.
 
@@ -1398,7 +1577,11 @@ bool CgtGpu::seedAnchors(const std::vector<cgt_u256> &keys, std::string &err) {
    mode near 40 Mkey/s while sequential mode ran two orders of magnitude
    faster. Lane i's anchor scalar is base + i*CGT_LANE_REGION, so its point is
    base*G + L_i where L_i comes from the table built in open(). One ladder for
-   the base, then one point addition per lane on the device. */
+   the base, then one point addition per lane on the device.
+
+   Now with Feistel permutation: physical lane -> logical lane mapping provides
+   per-lane randomness. Random offset within [0, CGT_LANE_REGION) provides
+   per-key randomness within each lane's region. */
 bool CgtGpu::seedAnchorsRandom(const cgt_u256 &base, std::string &err) {
   if (!ready) { err = "device not open"; return false; }
 
@@ -1413,10 +1596,19 @@ bool CgtGpu::seedAnchorsRandom(const cgt_u256 &base, std::string &err) {
     return false;
   }
 
+  /* Generate Feistel key and offset seed for this pass.
+     Use a simple hash of the base scalar to derive deterministic but
+     unpredictable values for this pass. */
+  uint64_t baseLow = base.w[0];
+  uint64_t baseHigh = base.w[1];
+  u32 feistelKey = (u32)(baseLow ^ (baseLow >> 32) ^ baseHigh ^ (baseHigh >> 32));
+  u32 offsetSeed = (u32)((baseLow >> 16) ^ (baseHigh << 16) ^ 0x9E3779B9u);
+
   cgtSeedKernel<<<blocks, threadsPerBlock>>>(
     (u64 *)dAnchorX, (u64 *)dAnchorY,
     (const u64 *)dBaseX, (const u64 *)dBaseY,
-    (const u64 *)dLaneOffX, (const u64 *)dLaneOffY);
+    (const u64 *)dLaneOffX, (const u64 *)dLaneOffY,
+    feistelKey, offsetSeed, lanes);
   cudaError_t e = cudaGetLastError();
   if (e != cudaSuccess) {
     err = std::string("seed kernel launch failed: ") + cudaGetErrorString(e);

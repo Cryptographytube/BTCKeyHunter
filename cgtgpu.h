@@ -59,6 +59,11 @@ public:
      itself. */
   bool seedAnchorsRandom(const cgt_u256 &base, std::string &err);
 
+  /* Sequential mode: place lane i's anchor at the exact scalar
+     base + i*CGT_LANE_REGION using one host scalar multiply plus a device
+     kernel that adds the precomputed per-lane offset. Exact tiling, no gaps. */
+  bool seedAnchorsExact(const cgt_u256 &base, std::string &err);
+
   /* Slide each lane's anchor forward by one region (on-device). Much cheaper
      than recomputing from scalars on the host. */
   bool advanceAnchors(std::string &err);

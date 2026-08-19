@@ -113,7 +113,8 @@ static void cgtUsage(void) {
   printf("  -r <START:END>      Search a custom hexadecimal range instead of a bit width.\n\n");
 
   printf("Options:\n");
-  printf("  -R                  Activate random mode.\n");
+  printf("  -R                  Random mode: sample keys uniformly from anywhere in the range\n");
+  printf("                      (every bit random). Best for ranges too large to scan in full.\n");
   printf("  -b                  Enable backup mode to resume from last progress.\n");
   printf("  -u                  Search for uncompressed public keys or use uncompressed targets.\n");
   printf("  -G <ID>             Specify the GPU ID to use, default is 0.\n");
@@ -249,8 +250,7 @@ int main(int argc, char **argv) {
      address engine. The pubkey engine compares x, which both serialisations
      share, so it finds a key given either form of the same point - and the
      hit's format is reported from what the target itself declared. */
-  if (pkMode && cfg.uncompressed)
-    printf("[+] Pubkey mode compares x-coordinates: -u has no effect.\n");
+  /* -u enables uncompressed pubkey format in both address and pubkey modes. */
 
   /* --------------------------------- GPU --------------------------------- */
   std::vector<cgt_devinfo> devs;
@@ -273,8 +273,9 @@ int main(int argc, char **argv) {
   }
   if (pkMode) {
     /* One x per point, so the kernel needs exactly one comparison per key -
-       the COMP specialisation - regardless of how the targets were written. */
-    gpu.setModes(true, false);
+       the COMP specialisation - regardless of how the targets were written.
+       The UNCOMP flag enables emission of uncompressed-format hits. */
+    gpu.setModes(!cfg.uncompressed, cfg.uncompressed);
     if (!gpu.uploadPubkeyFilter(pkpool.bloomData(), pkpool.bloomBytes(),
                                 (uint64_t)pkpool.bloomBits(), pkpool.bloomHashCount(),
                                 pkpool.xCoordData(), pkpool.xCoordCount(), err)) {
@@ -302,16 +303,14 @@ int main(int argc, char **argv) {
   cgtSub(spanU, ksEnd, ksStart);            /* inclusive width is spanU + 1 */
   double spanKeys = cgtToDouble(spanU) + 1.0;
 
-  uint64_t blockCount;
-  {
-    /* ceil((span+1)/stride) without risking the +1 overflowing a full range:
-       floor(span/stride) + 1 is the same number for every span. */
-    cgt_u256 q;
-    cgtDivU64(q, spanU, stride);
-    if (q.w[1] | q.w[2] | q.w[3]) blockCount = ~0ULL;   /* astronomically large */
-    else if (q.w[0] == ~0ULL)     blockCount = ~0ULL;
-    else                          blockCount = q.w[0] + 1ULL;
-  }
+  /* ceil((span+1)/stride) as a full 256-bit count: floor(span/stride) + 1 is
+     that number for every span (the +1 accounts for the inclusive end and for
+     the partial final block). A 2^256 range yields up to ~2^226 blocks, so this
+     genuinely needs 256 bits - and the walk feeds the index straight into the
+     base, which is what carries randomness into the high bits. */
+  cgt_u256 blockCount;
+  cgtDivU64(blockCount, spanU, stride);
+  cgtAddU64(blockCount, blockCount, 1);
 
   cgtSeedRNG();
   cgtBuildLadder();
@@ -330,7 +329,7 @@ int main(int argc, char **argv) {
          point somewhere else entirely - so say so rather than resume wrongly. */
       if (cgtCmp(st.start, ksStart) != 0 || cgtCmp(st.end, ksEnd) != 0) {
         printf("[+] Backup file is for a different range. Starting from scratch.\n");
-      } else if (st.stride != stride || st.blocks != blockCount) {
+      } else if (st.stride != stride || cgtCmp(st.blocks, blockCount) != 0) {
         printf("[+] Backup file was written with a different GPU geometry. Starting from scratch.\n");
       } else if (st.shuffled != cfg.random) {
         printf("[+] Backup file was written in %s mode. Starting from scratch.\n",
@@ -368,18 +367,24 @@ int main(int argc, char **argv) {
          d.smCount, d.major, d.minor, (double)d.memBytes / (1024.0 * 1024.0));
   printf("[+] Lanes %d, %s keys per pass\n", lanes,
          cgtScaleCount((double)gpu.keysPerPass()).c_str());
-  printf("[+] Coverage: %llu blocks of %s keys, each visited once\n",
-         (unsigned long long)blockCount,
-         cgtScaleCount((double)stride).c_str());
+  if (cfg.random)
+    printf("[+] Coverage: %s blocks of %s keys, each visited once in random order\n",
+           cgtScaleCount(cgtToDouble(blockCount)).c_str(),
+           cgtScaleCount((double)stride).c_str());
+  else
+    printf("[+] Coverage: %s blocks of %s keys, each visited once\n",
+           cgtScaleCount(cgtToDouble(blockCount)).c_str(),
+           cgtScaleCount((double)stride).c_str());
   if (pkMode)
     printf("[+] Engine: pubkey (x-coordinate compare, no SHA-256/RIPEMD-160)\n");
   else
     printf("[+] Engine: address (hash160)\n");
   if (cfg.uncompressed && !pkMode) printf("[+] Uncompressed targets\n");
   if (restored) {
-    double pct = blockCount ? (double)walk.position() * 100.0 / (double)blockCount : 0.0;
-    printf("[+] Restoring from backup was successful. Resuming at block %llu of %llu (%.4f%% done)\n",
-           (unsigned long long)walk.position(), (unsigned long long)blockCount, pct);
+    double bc = cgtToDouble(blockCount);
+    double pct = bc > 0.0 ? (double)walk.position() * 100.0 / bc : 0.0;
+    printf("[+] Restoring from backup was successful. Resuming at block %llu of %s (%.4f%% done)\n",
+           (unsigned long long)walk.position(), cgtScaleCount(bc).c_str(), pct);
   }
   printf("\n");
 
@@ -395,9 +400,6 @@ int main(int argc, char **argv) {
   /* A lane's anchor sits in the middle of the window it sweeps. */
   cgt_u256 halfSpan;
   cgtSetU64(halfSpan, CGT_STRIDE_HALF);
-
-  cgt_u256 laneRegion;
-  cgtSetU64(laneRegion, (uint64_t)CGT_LANE_REGION);
 
   std::vector<cgt_hit> hits;
   std::set<std::string> seenKeys;     /* so one key is reported once */
@@ -415,39 +417,57 @@ int main(int argc, char **argv) {
 
   cgt_u256 blockBase;                 /* first key of the block being scanned */
   cgtSetZero(blockBase);
-  uint64_t prevBlock = 0;
+  cgt_u256 prevBlock;
+  cgtSetZero(prevBlock);
   bool havePrev = false;
   std::string lastKeyText = "-";
   uint64_t passCounter = 0;           /* seeds the status line's sampled key */
 
+  /* Both modes walk the range exhaustively and stop once it is covered. Having
+     found every target is an additional early exit - there is nothing left to
+     search for once they are all in hand - so record how many that is. */
+  const uint64_t totalTargets = pkMode ? (uint64_t)pkpool.count()
+                                       : (uint64_t)pool.count();
+
   while (!cgtStop && !walk.done()) {
     double tPassStart = profile ? cgtNow() : 0.0;
 
-    uint64_t blk = walk.next();
-
-    /* blockBase = ksStart + blk*stride */
+    /* One block index from the walk - ascending in sequential mode, a
+       no-repeat/no-skip permutation of the same indices in random mode. Either
+       way blockBase = ksStart + blk*stride, and because blk is a full 256-bit
+       index every bit of the base varies from block to block, the high bits
+       included - which is what stops a large random range from freezing its top
+       bits at the range start. The walk reports done() once every block index
+       has come up exactly once, so both modes terminate when the range has been
+       covered in full - no repeat, no skip. */
+    cgt_u256 blk = walk.next();
     {
-      cgt_u256 off;
-      cgtSetU64(off, blk);
       cgt_u256 scaled;
-      cgtMulU64(scaled, off, stride);
+      cgtMulU64(scaled, blk, stride);
       cgtAdd(blockBase, ksStart, scaled);
     }
 
-    /* Seeding costs one host scalar multiply. When the walk happens to hand
-       out the very next block - which is every pass in sequential mode - the
-       device can slide its own anchors forward instead, and the host does no
-       curve work at all. */
-    if (havePrev && blk == prevBlock + 1) {
+    /* Seeding costs one host scalar multiply. When the walk hands out the very
+       next block - every pass in sequential mode, and only by chance in random
+       mode - the device can slide its own anchors forward instead, and the host
+       does no curve work at all. */
+    cgt_u256 pp1;
+    cgtAddU64(pp1, prevBlock, 1);
+    bool adjacent = havePrev && cgtCmp(blk, pp1) == 0;
+    if (adjacent) {
       if (!gpu.advanceAnchors(err)) {
         cgtClearStatus();
         fprintf(stderr, "[ERROR] %s\n", err.c_str());
         return -1;
       }
     } else {
+      /* Seed every lane at the exact centre of the region it sweeps
+         (blockBase + halfSpan + i*laneRegion) so the blocks tile the range with
+         no gaps or overlap: one host scalar multiply for the base point, then a
+         device kernel adds the precomputed per-lane offset i*R. */
       cgt_u256 seed;
       cgtAdd(seed, blockBase, halfSpan);
-      if (!gpu.seedAnchorsRandom(seed, err)) {
+      if (!gpu.seedAnchorsExact(seed, err)) {
         cgtClearStatus();
         fprintf(stderr, "[ERROR] %s\n", err.c_str());
         return -1;
@@ -627,15 +647,22 @@ int main(int argc, char **argv) {
       }
     }
 
+    /* Once every target has been found there is nothing left to search for, so
+       stop rather than run out the rest of the range. (The walk also terminates
+       on its own via done() when the range has been covered in full.) */
+    if (totalTargets > 0 && found >= totalTargets) break;
+
     /* --- periodic status line --- */
     double now2 = cgtNow();
     if (now2 - lastReport >= 1.0) {
       double el = now2 - t0;
       double rate = el > 0.0 ? totalKeys / el : 0.0;
 
-      /* Progress is the walk's own cursor, so it counts blocks actually
-         retired rather than an estimate - and a resumed run picks up the
-         percentage it left off at. */
+      /* Progress is the walk's own cursor - blocks actually retired times the
+         block size - so it is exact and a resumed run picks up where it left
+         off. Over a uniform range this same fraction is the probability the
+         target has been covered at least once, which is what random mode wants
+         to show. */
       double done = (double)walk.position() * (double)stride;
       double prob = spanKeys > 0.0 ? (done / spanKeys) * 100.0 : 0.0;
       if (prob > 100.0) prob = 100.0;
@@ -701,17 +728,23 @@ int main(int argc, char **argv) {
   printf("\n[+] Scanned %s keys in %.1f s (%.2f Mkey/s)\n",
          cgtScaleCount(totalKeys).c_str(), el,
          el > 0.0 ? totalKeys / el / 1.0e6 : 0.0);
-  printf("[+] Progress: block %llu of %llu (%.6f%% of the range)\n",
-         (unsigned long long)walk.position(), (unsigned long long)blockCount,
-         blockCount ? (double)walk.position() * 100.0 / (double)blockCount : 0.0);
-  if (exhausted) {
-    printf("[+] Range fully covered: every key in the range was checked exactly once.\n");
-    if (found == 0) printf("[+] Range exhausted, no match found.\n");
-  } else if (cfg.resume) {
-    printf("[+] Progress saved to %s. Re-run with -b to continue from here.\n",
-           ckpt.file().c_str());
-  } else if (cgtStop) {
-    printf("[+] Progress not saved (run with -b to make a stopped run resumable).\n");
+  {
+    double bc = cgtToDouble(blockCount);
+    printf("[+] Progress: block %llu of %s (%.6f%% of the range)\n",
+           (unsigned long long)walk.position(), cgtScaleCount(bc).c_str(),
+           bc > 0.0 ? (double)walk.position() * 100.0 / bc : 0.0);
+    if (exhausted) {
+      if (cfg.random)
+        printf("[+] Range fully covered in random order: every key checked exactly once, none repeated.\n");
+      else
+        printf("[+] Range fully covered: every key in the range was checked exactly once.\n");
+      if (found == 0) printf("[+] Range exhausted, no match found.\n");
+    } else if (cfg.resume) {
+      printf("[+] Progress saved to %s. Re-run with -b to continue from here.\n",
+             ckpt.file().c_str());
+    } else if (cgtStop) {
+      printf("[+] Progress not saved (run with -b to make a stopped run resumable).\n");
+    }
   }
   printf("[+] Found %llu key%s\n", (unsigned long long)found, found == 1 ? "" : "s");
   fflush(stdout);
